@@ -34,3 +34,11 @@ def lambda_handler(event, context):
         'statusCode': response.status,
         'body': response.data.decode()
     }
+
+def lambda_handler(event, context):
+    print("Received S3 Event:", json.dumps(event))
+    key = event['Records'][0]['s3']['object']['key']
+    if not key.endswith(".csv") or "streams" not in key:
+        print(f"Not a valid stream CSV: {key}. Skipping.")
+        return {"statusCode": 200, "body": "No action taken."}
+
