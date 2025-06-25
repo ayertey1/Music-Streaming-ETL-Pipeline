@@ -1,44 +1,35 @@
-import boto3
 import json
+import boto3
 import os
 import urllib3
-from base64 import b64encode
-
-MWAA_ENV_NAME = os.environ['MWAA_ENV_NAME']
-DAG_NAME = os.environ['DAG_NAME']
 
 def lambda_handler(event, context):
-    mwaa_client = boto3.client('mwaa')
-    env = mwaa_client.get_environment(Name=MWAA_ENV_NAME)
-    web_token = mwaa_client.create_cli_token(Name=MWAA_ENV_NAME)['CliToken']
-    web_server_hostname = env['Environment']['WebserverUrl']
+    mwaa_env_name = os.environ['MWAA_ENV_NAME']
+    dag_name = os.environ['DAG_NAME']
+    
+    # Get MWAA CLI Token
+    mwaa = boto3.client('mwaa')
+    env_info = mwaa.get_environment(Name=mwaa_env_name)
+    web_token = mwaa.create_cli_token(Name=mwaa_env_name)
+    mwaa_cli_token = web_token['CliToken']
+    mwaa_web_server = env_info['Environment']['WebserverUrl']
 
-    dag_run_url = f"https://{web_server_hostname}/aws_mwaa/cli"
-
-    body = f"dags trigger {DAG_NAME}"
-    encoded_body = b64encode(body.encode()).decode()
-
+    # Trigger DAG via Airflow CLI API endpoint
     http = urllib3.PoolManager()
+    trigger_command = f"dags trigger {dag_name}"
+
     response = http.request(
         'POST',
-        dag_run_url,
+        f'https://{mwaa_web_server}/aws_mwaa/cli',
         headers={
-            "Authorization": f"Bearer {web_token}",
-            "Content-Type": "application/json"
+            'Authorization': f'Bearer {mwaa_cli_token}',
+            'Content-Type': 'text/plain'
         },
-        body=json.dumps({"cli": encoded_body})
+        body=trigger_command.encode()
     )
 
-    print("Response:", response.status, response.data)
+    print(f"Triggered DAG {dag_name}: {response.data.decode('utf-8')}")
     return {
-        'statusCode': response.status,
-        'body': response.data.decode()
+        'statusCode': 200,
+        'body': json.dumps('DAG triggered successfully!')
     }
-
-def lambda_handler(event, context):
-    print("Received S3 Event:", json.dumps(event))
-    key = event['Records'][0]['s3']['object']['key']
-    if not key.endswith(".csv") or "streams" not in key:
-        print(f"Not a valid stream CSV: {key}. Skipping.")
-        return {"statusCode": 200, "body": "No action taken."}
-
