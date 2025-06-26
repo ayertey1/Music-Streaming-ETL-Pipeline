@@ -5,33 +5,58 @@ from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 from airflow.utils.dates import days_ago
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.models import Variable
-
 import boto3
 from datetime import datetime
+import json
 
 def branch_on_validation(**kwargs):
-    return "transform_data" if kwargs['ti'].xcom_pull(task_ids='validate_data') == 'continue' else "skip_etl"
+    
+    s3 = boto3.client("s3")
+    try:
+        response = s3.get_object(
+            Bucket="rawdata-store-mwaa",
+            Key="validation_status/last_result.json"
+        )
+        result = json.loads(response['Body'].read().decode('utf-8'))
+        if result.get("validated"):
+            return "transform_data"
+        else:
+            return "skip_etl"
+    except Exception as e:
+        print(f"Branch decision failed: {e}")
+        return "skip_etl"
+
 
 def log_etl_summary(**kwargs):
     run_id = kwargs['run_id'] if 'run_id' in kwargs else kwargs['ti'].run_id
     start_time = kwargs['ti'].start_date.isoformat()
     end_time = datetime.utcnow().isoformat()
     status = kwargs.get('status', 'success')
-    processed_files = kwargs['ti'].xcom_pull(task_ids='validate_data', key='processed_files') or []
 
     try:
-        dynamodb = boto3.resource("dynamodb")
+        # Read processed file list from S3
+        s3 = boto3.client("s3")
+        response = s3.get_object(Bucket="rawdata-store-mwaa", Key="validation_status/processed_files.json")
+        processed_files = json.loads(response["Body"].read().decode("utf-8"))
+        print(f"Read {len(processed_files)} processed file(s) from S3.")
+    except Exception as e:
+        print(f"Could not read processed_files from S3: {e}")
+        processed_files = []
+
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name="eu-north-1")  # ensure region matches
         table = dynamodb.Table("etl_logs")
-        table.put_item(Item={
+        response = table.put_item(Item={
             "run_id": run_id,
             "status": status,
             "started_at": start_time,
             "ended_at": end_time,
             "processed_files": processed_files
         })
-        print(f"Logged ETL summary for run_id={run_id}, status={status}")
+        print(f"ETL log entry saved to DynamoDB: {response}")
     except Exception as e:
         print(f"Failed to log ETL summary: {e}")
+
 
 with DAG(
     dag_id="music_streaming_etl_v2",

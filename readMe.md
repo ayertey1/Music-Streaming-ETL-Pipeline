@@ -1,127 +1,192 @@
-# Music Streaming ETL Pipeline
+#  Music Streaming ETL Pipeline
 
-This project implements a near-real-time ETL pipeline for a music streaming platform using Amazon Web Services (AWS). The pipeline ingests stream data from S3, validates and transforms it using AWS Glue and Apache Airflow (MWAA), and stores key performance indicators (KPIs) into DynamoDB for analytics and monitoring.
+This project implements a **production-grade, event-driven ETL pipeline** for a music streaming platform using **Amazon Web Services (AWS)**. It processes user stream data in near real-time and generates business-critical **genre-level KPIs** stored in DynamoDB for downstream analytics, dashboards, and reports.
+
+> Designed with scalability, observability, and modularity in mind using fully managed services.
 
 ---
 
 ## Architecture Overview
 
-The pipeline is event-driven and fully serverless, built with the following AWS components:
+This pipeline leverages a **serverless architecture** composed of the following AWS components:
 
-* **Amazon S3** – Source of incoming stream data and storage for raw, transformed, and archived files
-* **AWS Lambda** – Triggered by new S3 uploads to start the DAG in MWAA
-* **Amazon MWAA (Airflow)** – Orchestrates the ETL steps as a DAG
-* **AWS Glue Jobs** – Performs validation, transformation, and ingestion tasks
-* **Amazon DynamoDB** – Stores both KPI metrics and ETL execution logs
-* **Amazon CloudWatch Logs** – Captures logs from Airflow and Glue for observability
+- **Amazon S3** – Raw stream, song metadata, and user metadata source; also stores transformed outputs
+- **AWS Lambda** – Triggers the MWAA DAG when a new stream file lands in S3
+- **Amazon MWAA (Airflow)** – Orchestrates the ETL flow using a DAG
+- **AWS Glue (Python Shell & Spark Jobs)** – Handles validation, transformation, and ingestion
+- **Amazon DynamoDB** – Stores processed KPIs and ETL audit logs
+- **Amazon CloudWatch Logs** – Captures logs from MWAA and Glue for centralized monitoring
 
 ---
 
-## Components
-
-### 1. **S3 Bucket Layout**
-
+## S3 Directory Layout
 ```text
 s3://rawdata-store-mwaa/
-├── music-streaming/
-│   ├── raw/                  # Incoming raw files (songs.csv, users.csv, stream*.csv)
-│   ├── archive/              # Archived validated stream files
-│   └── transformed/         # Output KPIs in partitioned Parquet
+└── music-streaming/
+    ├── raw/           # Input data (songs.csv, users.csv, stream*.csv)
+    ├── transformed/   # Output KPIs in partitioned Parquet
+    └── archive/       # Archived/processed stream files
+```
+##  Pipeline Components
+---
+
+### 1. **Validation Job** (`validate_music_streams` – Python Shell)
+
+* Checks for required columns in:
+
+  * `songs.csv` (e.g., track\_id, track\_genre)
+  * `users.csv` (e.g., user\_id, created\_at)
+  * All incoming `stream*.csv` files
+* Uses `processed_files_log` in **DynamoDB** to avoid reprocessing
+* Skips the pipeline if no new stream files are found
+* Logs all results (pass/fail/skip)
+
+---
+
+### 2. **Transformation Job** (`transform_music_kpis` – Spark)
+
+* Joins raw `streams`, `songs`, and `users`
+* Calculates daily genre-level and track-level KPIs:
+
+  * `listen_count`, `unique_listeners`, `total_listening_time`, `avg_listening_time_per_user`
+  * `Top 3 Songs` per genre/day
+  * `Top 5 Genres` per day
+* Writes results to **partitioned Parquet** files in S3
+* Archives processed stream files to `archive/`
+* Logs successfully processed files to DynamoDB
+
+---
+
+### 3. **Ingestion Job** (`dynamo_kpi_ingestion` – Python Shell)
+
+* Reads Parquet outputs from `transformed/`
+* Inserts metrics into `daily_kpis` table in DynamoDB:
+
+  * Partition key: `date`
+  * Sort key: `data_type` (e.g., `GENRE_KPI#Pop`)
+* Supports safe ingestion with `Decimal` handling and deduplication
+* Marks successful ingestion in `processed_files_log`
+
+---
+
+## DAG Overview: `music_streaming_etl_v2`
+
+### Orchestrated by MWAA
+
+## DAG Flow:
+
+```text
+start
+  └─> validate_data (Glue)
+         └─> branch_decision
+              ├─> skip_etl
+              └─> transform_data (Glue)
+                     └─> ingest_dynamo (Glue)
+                             └─> log_etl_summary
 ```
 
-### 2. **Glue Jobs**
+## Task Descriptions
 
-#### Validation Job (Python Shell)
+| Task              | Description                                           |
+| ----------------- | ----------------------------------------------------- |
+| `validate_data`   | Glue job to validate file structure and log new files |
+| `branch_decision` | Skips rest of DAG if no new files                     |
+| `transform_data`  | Spark job to compute KPIs and archive data            |
+| `ingest_dynamo`   | Loads KPIs into DynamoDB                              |
+| `log_etl_summary` | Writes audit log entry to `etl_logs` table            |
 
-* Validates required columns in all CSVs
-* Logs processed files into `processed_files_log` table in DynamoDB
-* Skips DAG execution if no new files are found
+## `etl_logs` Schema
 
-#### Transformation Job (Spark)
-
-* Joins songs, users, and stream data
-* Computes:
-
-  * Listen Count
-  * Unique Listeners
-  * Total Listening Time
-  * Average Listening Time per User
-  * Top 3 Songs per Genre per Day
-  * Top 5 Genres per Day
-* Writes output to partitioned Parquet in S3
-* Archives processed stream files
-
-#### DynamoDB Ingestion Job (Python Shell)
-
-* Reads Parquet outputs
-* Inserts KPI data into the `daily_kpis` table
-* Logs successful runs into `processed_files_log`
+| Field             | Type   | Description                       |
+| ----------------- | ------ | --------------------------------- |
+| `run_id`          | String | Unique Airflow DAG run identifier |
+| `status`          | String | success, failed, or skipped       |
+| `started_at`      | String | ISO timestamp of run start        |
+| `ended_at`        | String | ISO timestamp of run end          |
+| `processed_files` | List   | Names of validated stream files   |
 
 ---
 
-## Airflow DAG: `music_streaming_etl_v2`
+## Example KPIs Computed
 
-### DAG Flow:
-
-1. **Start → Validate Data**
-2. **Branch: Skip DAG** if no new stream files
-3. **Transform Data** with Glue Spark Job
-4. **Ingest KPIs** into DynamoDB
-5. **Log ETL Run** to `etl_logs` table
-6. **End**
-
-### Logging
-
-All ETL runs are logged in DynamoDB `etl_logs` with fields:
-
-* `run_id`, `status`, `started_at`, `ended_at`, `processed_files`
+| Metric                 | Description                               |
+| ---------------------- | ----------------------------------------- |
+| `Listen Count`         | Number of streams per genre/day           |
+| `Unique Listeners`     | Distinct users per genre/day              |
+| `Total Listening Time` | Sum of `duration_ms` across all streams   |
+| `Avg Listening Time`   | Average listening time per user/genre/day |
+| `Top 3 Songs`          | Most streamed tracks per genre/day        |
+| `Top 5 Genres`         | Most streamed genres per day              |
 
 ---
 
-## Requirements
+## IAM Requirements
 
-```txt
-pandas==2.2.2
-pyarrow==15.0.2
-apache-airflow-providers-amazon>=6.1.0
+### MWAA Execution Role Must Have:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "airflow:*",
+    "glue:StartJobRun",
+    "glue:GetJob*",
+    "dynamodb:*",
+    "logs:*",
+    "cloudwatch:*",
+    "s3:*"
+  ],
+  "Resource": "*"
+}
 ```
 
-Upload this as `requirements.txt` to your MWAA S3 bucket and link it in the MWAA console.
+### Lambda Role (for triggering MWAA):
 
----
-
-## IAM Policies
-
-Ensure the following permissions are included in the MWAA execution role:
-
-* `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`
-* `glue:StartJobRun`, `glue:GetJobRun`, `glue:GetJob`
-* `dynamodb:PutItem`, `dynamodb:GetItem`
-* `logs:*`, `cloudwatch:PutMetricData`
-* `airflow:PublishMetrics`
-* `sqs:*`, `kms:*` (for Celery queues)
+* `airflow:GetEnvironment`, `airflow:CreateCliToken`
+* `s3:GetObject` (for event data if needed)
 
 ---
 
 ## Setup Checklist
 
-1. Upload DAG to `s3://<mwaa-bucket>/dags/`
-2. Upload `requirements.txt` to root of S3 and link in MWAA console
-3. Create Glue Jobs: `validate_music_streams`, `transform_music_kpis`, `dynamo_kpi_ingestion`
-4. Create DynamoDB tables: `processed_files_log`, `daily_kpis`, `etl_logs`
-5. Deploy Lambda that triggers DAG when new stream file is added to S3
-6. Grant MWAA and Lambda roles proper IAM permissions
+1. Upload DAG to: `s3://<MWAA-bucket>/dags/`
+2. Upload `requirements.txt` and link in MWAA
+3. Create three AWS Glue jobs:
+
+   * `validate_music_streams` (Python Shell)
+   * `transform_music_kpis` (Spark)
+   * `dynamo_kpi_ingestion` (Python Shell)
+4. Create DynamoDB tables:
+
+   * `processed_files_log`
+   * `daily_kpis`
+   * `etl_logs`
+5. Deploy Lambda function triggered on new S3 upload to `raw/streams/`
+6. Assign correct IAM policies to MWAA and Lambda roles
 
 ---
 
-## Example KPIs Tracked
+## Dependencies
 
-* `Listen Count`: Total streams per genre/day
-* `Unique Listeners`: Distinct users per genre/day
-* `Total Listening Time`: Sum of duration\_ms
-* `Average Listening Time`: Per user per genre/day
-* `Top 3 Songs` per genre/day
-* `Top 5 Genres` per day
+These must be included in your MWAA environment’s `requirements.txt`:
+
+```text
+pandas==2.2.2
+pyarrow==15.0.2
+apache-airflow-providers-amazon>=6.1.0
+```
 
 ---
+
+## Monitoring
+
+| Layer      | Logs Captured In          |
+| ---------- | ------------------------- |
+| Airflow    | Amazon CloudWatch Logs    |
+| Glue       | AWS Glue Job Logs         |
+| Lambda     | CloudWatch Logs           |
+| Audit Logs | DynamoDB `etl_logs` table |
+
+---
+
 
